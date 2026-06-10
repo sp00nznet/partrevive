@@ -46,6 +46,12 @@ def red(s): return _c("31", s)
 def dim(s): return _c("2", s)
 
 _logfh = None
+_sink = None
+
+def set_log_sink(fn):
+    """Register a callback that receives every log line (used by the GUI)."""
+    global _sink
+    _sink = fn
 
 def log(msg: str, *, quiet_console=False):
     global _logfh
@@ -54,6 +60,24 @@ def log(msg: str, *, quiet_console=False):
         _logfh.write(line + "\n"); _logfh.flush()
     if not quiet_console:
         print(msg)
+    if _sink:
+        try:
+            _sink(msg)
+        except Exception:
+            pass
+
+
+def list_disks() -> list[dict]:
+    """Whole disks (no partitions/loops) for a picker: name, size, model, tran."""
+    out = run(["lsblk", "-dn", "-o", "NAME,SIZE,TYPE,TRAN,MODEL"], check=False).stdout
+    disks = []
+    for line in out.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) >= 3 and parts[2] == "disk" and not parts[0].startswith("loop"):
+            disks.append({"dev": f"/dev/{parts[0]}", "size": parts[1],
+                          "tran": parts[3] if len(parts) > 3 else "",
+                          "model": parts[4] if len(parts) > 4 else ""})
+    return disks
 
 def die(msg: str, code: int = 1):
     log(red("error: ") + msg)
@@ -194,7 +218,7 @@ SIGNATURES = [
 
 # ---- scan -------------------------------------------------------------------
 
-def scan(dev: str, *, deep: bool, progress=True) -> list[Candidate]:
+def scan(dev: str, *, deep: bool, progress=True, on_progress=None, on_found=None) -> list[Candidate]:
     total_sectors = dev_size_sectors(dev)
     total = total_sectors * SECTOR
     found: dict[int, Candidate] = {}     # keyed by start sector, first hit wins
@@ -230,11 +254,16 @@ def scan(dev: str, *, deep: bool, progress=True) -> list[Candidate]:
                                 f"({cand.size*SECTOR/1e9:.2f} GB)"
                                 f"{(' '+cand.label) if cand.label else ''}"),
                             quiet_console=True)
+                        if on_found:
+                            on_found(cand)
             pos += CHUNK
-            if progress and total:
-                pct = int(pos * 100 / total)
+            if total:
+                pct = min(100, int(pos * 100 / total))
                 if pct != last_pct:
-                    print(f"\r  scan {min(pct,100):3d}%", end="", flush=True)
+                    if progress:
+                        print(f"\r  scan {pct:3d}%", end="", flush=True)
+                    if on_progress:
+                        on_progress(pct)
                     last_pct = pct
             if not deep:
                 # quick mode: filesystem boot sectors live at the partition's
@@ -253,7 +282,7 @@ def _losetup(dev, start_sector, size_sectors) -> str:
                "--sizelimit", str(size_sectors * SECTOR), dev]).stdout.strip()
     return out
 
-def verify(dev: str, cands: list[Candidate]) -> list[Candidate]:
+def verify(dev: str, cands: list[Candidate], on_result=None) -> list[Candidate]:
     log(bold("verifying candidates read-only (mount test) ..."))
     mnt = tempfile.mkdtemp(prefix="partrevive_")
     try:
@@ -289,6 +318,8 @@ def verify(dev: str, cands: list[Candidate]) -> list[Candidate]:
                   yellow("swap ") if c.fstype == "swap" else red("ghost"))
             log(f"  [{tag}] {c.fstype:6} @ {c.start:>12}  {c.size*SECTOR/1e9:7.2f} GB  "
                 f"{c.blkid}{('  -> '+c.note) if c.note else ''}")
+            if on_result:
+                on_result(c)
     finally:
         shutil.rmtree(mnt, ignore_errors=True)
     return cands
@@ -352,6 +383,16 @@ def restore(dev: str, parts: list[Candidate], *, assume_yes: bool, backup_dir: s
         if ans != "y":
             die("aborted by user", code=0)
 
+    backup = write_gpt(dev, parts, backup_dir)
+    log(green("partition table written."))
+    print()
+    log(run(["sgdisk", "-p", dev]).stdout)
+    log(dim(f"undo with:  sgdisk --load-backup={backup} {dev}"))
+
+
+def write_gpt(dev: str, parts: list[Candidate], backup_dir: str) -> str:
+    """Back up the current table and write the new GPT. Returns the backup path.
+    The single disk-writing primitive; shared by the CLI and the GUI."""
     os.makedirs(backup_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     backup = os.path.join(backup_dir, f"{os.path.basename(dev)}-gpt-{stamp}.bin")
@@ -370,10 +411,7 @@ def restore(dev: str, parts: list[Candidate], *, assume_yes: bool, backup_dir: s
     run(args)
     run(["partprobe", dev], check=False)
     time.sleep(2)
-    log(green("partition table written."))
-    print()
-    log(run(["sgdisk", "-p", dev]).stdout)
-    log(dim(f"undo with:  sgdisk --load-backup={backup} {dev}"))
+    return backup
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -427,6 +465,11 @@ def _open_log(dev):
         _logfh = None
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "gui":
+        import partrevive_gui
+        partrevive_gui.main()
+        return
+
     ap = argparse.ArgumentParser(prog="partrevive",
         description="Recover a lost/deleted partition table by scanning for "
                     "filesystem signatures and verifying them read-only.")

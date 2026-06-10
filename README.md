@@ -46,6 +46,21 @@ sudo ./partrevive.py verify /dev/sdb      # eyeball what's live
 sudo ./partrevive.py auto   /dev/sdb      # let it rebuild, confirm at the prompt
 ```
 
+### GUI
+
+A Tkinter front-end (same engine, imports `partrevive.py`) walks the pipeline
+as a guided flow — pick a disk, **① Scan & Verify** (read-only), **② Build
+Plan**, **③ Restore**. Candidates are colour-coded live vs ghost, the proposed
+table is shown before any write, and Restore stays disabled until there's a
+valid plan and the disk is unmounted.
+
+```bash
+sudo apt install python3-tk        # if tkinter isn't present
+sudo python3 partrevive_gui.py     # or:  sudo python3 partrevive.py gui
+```
+
+### CLI
+
 Example output (a disk with a live Windows layout over dead Linux ghosts):
 
 ```
