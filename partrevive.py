@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass, field, asdict
 
 SECTOR = 512
+MIN_PART_SECTORS = 2048            # ignore sub-1MiB "partitions" (noise)
 CHUNK = 16 * 1024 * 1024           # sweep read size
 OVERLAP = 1 * 1024 * 1024          # re-read window so signatures don't straddle chunks
 LOGFILE = "partrevive.log"
@@ -109,9 +110,14 @@ def _u(b: bytes) -> int:           # little-endian unsigned
     return int.from_bytes(b, "little")
 
 
+def _has_jump(bs: bytes) -> bool:
+    # real FAT/NTFS/exFAT boot sectors begin with a jump: EB xx 90 or E9 xx xx
+    return bs[0] == 0xEB or bs[0] == 0xE9
+
+
 def _detect_ntfs(dev, part_start_byte):
     bs = read_at(dev, part_start_byte, SECTOR)
-    if bs[3:11] != b"NTFS    " or bs[510:512] != b"\x55\xaa":
+    if bs[3:11] != b"NTFS    " or bs[510:512] != b"\x55\xaa" or not _has_jump(bs):
         return None
     total = _u(bs[0x28:0x30])      # excludes the backup boot sector
     if total <= 0 or total > (1 << 40):
@@ -122,7 +128,7 @@ def _detect_ntfs(dev, part_start_byte):
 
 def _detect_exfat(dev, part_start_byte):
     bs = read_at(dev, part_start_byte, SECTOR)
-    if bs[3:11] != b"EXFAT   " or bs[510:512] != b"\x55\xaa":
+    if bs[3:11] != b"EXFAT   " or bs[510:512] != b"\x55\xaa" or not _has_jump(bs):
         return None
     vol_len = _u(bs[0x48:0x50])     # sectors
     if vol_len <= 0:
@@ -132,7 +138,7 @@ def _detect_exfat(dev, part_start_byte):
 
 def _detect_fat(dev, part_start_byte):
     bs = read_at(dev, part_start_byte, SECTOR)
-    if bs[510:512] != b"\x55\xaa":
+    if bs[510:512] != b"\x55\xaa" or not _has_jump(bs):
         return None
     is32 = bs[0x52:0x57] == b"FAT32"
     is16 = bs[0x36:0x3b] in (b"FAT16", b"FAT12", b"FAT  ")
@@ -149,6 +155,8 @@ def _detect_fat(dev, part_start_byte):
 def _detect_ext(dev, part_start_byte):
     sb = read_at(dev, part_start_byte + 1024, 1024)   # ext superblock @ +1024
     if sb[0x38:0x3a] != b"\x53\xef":                  # s_magic 0xEF53
+        return None
+    if _u(sb[0x5a:0x5c]) != 0:                        # s_block_group_nr: 0 = primary, else a backup
         return None
     blocks = _u(sb[0x04:0x08])
     log_bs = _u(sb[0x18:0x1c])
@@ -187,7 +195,8 @@ SIGNATURES = [
 # ---- scan -------------------------------------------------------------------
 
 def scan(dev: str, *, deep: bool, progress=True) -> list[Candidate]:
-    total = dev_size_sectors(dev) * SECTOR
+    total_sectors = dev_size_sectors(dev)
+    total = total_sectors * SECTOR
     found: dict[int, Candidate] = {}     # keyed by start sector, first hit wins
     log(dim(f"scanning {dev} ({total/1e9:.1f} GB){' [deep]' if deep else ''} ..."))
     pos = 0
@@ -214,7 +223,8 @@ def scan(dev: str, *, deep: bool, progress=True) -> list[Candidate]:
                         cand = detector(dev, part_byte)
                     except OSError:
                         cand = None
-                    if cand and 0 < cand.size <= dev_size_sectors(dev):
+                    if (cand and MIN_PART_SECTORS <= cand.size
+                            and cand.start + cand.size <= total_sectors):
                         found[cand.start] = cand
                         log(dim(f"  + {cand.fstype:6} @ sector {cand.start} "
                                 f"({cand.size*SECTOR/1e9:.2f} GB)"
