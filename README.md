@@ -1,5 +1,10 @@
 # partrevive
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python 3](https://img.shields.io/badge/python-3-blue.svg)](https://www.python.org/)
+[![No dependencies](https://img.shields.io/badge/deps-stdlib%20only-brightgreen.svg)](#install)
+[![Platform: Linux](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#install)
+
 Recover a **lost or deleted partition table** by scanning the raw disk for
 filesystem signatures, verifying every candidate **read-only**, and rewriting a
 clean GPT — a more automated take on TestDisk's "find lost partitions" flow.
