@@ -116,5 +116,9 @@ Windows disks. See [docs/SIGNATURES.md](docs/SIGNATURES.md).
 
 ## Status
 
-Private / early. Tested recovering a deleted GPT on a 240 GB SATA SSD
+Early. Tested recovering a deleted GPT on a 240 GB SATA SSD
 (Windows + EFI + Recovery over stale Linux partitions).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
