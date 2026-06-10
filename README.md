@@ -86,14 +86,10 @@ sudo python3 partrevive_gui.py     # or:  sudo python3 partrevive.py gui
 
 ### CLI
 
-Example output (a disk with a live Windows layout over dead Linux ghosts):
+`verify` on a disk with a live Windows layout over dead Linux ghosts —
+each candidate is mounted read-only and colour-coded **LIVE** / ghost / swap:
 
-```
-  [LIVE ] ntfs   @         2048     0.47 GB  TYPE="ntfs" LABEL="Recovery"
-  [LIVE ] vfat   @       923648     0.10 GB  TYPE="vfat"   -> EFI System Partition
-  [ghost] ext4   @     21313536     8.69 GB  TYPE="ext4"   -> mount failed
-  [LIVE ] ntfs   @      1161216   239.46 GB  TYPE="ntfs"
-```
+![partrevive verify output](docs/screenshot-verify.png)
 
 ## Safety model
 
