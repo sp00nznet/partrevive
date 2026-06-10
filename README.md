@@ -17,6 +17,13 @@ filesystem's **own size field** sets the partition end, so nothing is truncated.
 > ⚠️ Recovery tool for disks you own. `restore`/`auto` write a partition table.
 > They back up the existing one first, but read the proposed table before saying yes.
 
+## Demo
+
+`verify` mount-tests every candidate read-only and sorts the live filesystems
+from the ghosts left by an earlier install:
+
+![partrevive verify demo](docs/demo.gif)
+
 ## Install
 
 Single file, Python 3, stdlib only. Needs root and these tools on PATH:
