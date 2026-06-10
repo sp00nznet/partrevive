@@ -29,15 +29,30 @@ Five subcommands, each a superset of the previous. Everything up to `restore`
 is **read-only**.
 
 ```bash
-sudo ./partrevive.py scan    /dev/sdX     # list candidate filesystems
-sudo ./partrevive.py verify  /dev/sdX     # + mount-test each (live vs ghost)
-sudo ./partrevive.py plan    /dev/sdX     # + resolve overlaps -> proposed GPT
-sudo ./partrevive.py restore /dev/sdX     # + back up table + write it (prompts)
-sudo ./partrevive.py auto    /dev/sdX     # the whole pipeline in one shot
+sudo ./partrevive.py scan    /dev/sdX            # list candidate filesystems
+sudo ./partrevive.py verify  /dev/sdX            # + mount-test each (live vs ghost)
+sudo ./partrevive.py plan    /dev/sdX            # + resolve overlaps -> proposed GPT
+sudo ./partrevive.py rescue  /dev/sdX --to DIR   # copy files out (source stays read-only)
+sudo ./partrevive.py restore /dev/sdX            # + back up table + write it (prompts)
+sudo ./partrevive.py auto    /dev/sdX            # the whole pipeline in one shot
+sudo ./partrevive.py undo    /dev/sdX TABLE.bin  # roll back to a saved table
+```
+
+The `device` can also be a **disk image file** — partrevive attaches it as a
+loop device automatically, so you can `ddrescue` a flaky drive to an image and
+recover against the copy:
+
+```bash
+sudo ./partrevive.py rescue disk.img --to ~/recovered
 ```
 
 Useful flags: `--deep` (full-surface sweep), `--json` (machine-readable),
-`-y/--yes` (skip the write confirmation), `--backup-dir DIR`.
+`-y/--yes` (skip the write confirmation), `--force` (write even if SMART reports
+failing), `--backup-dir DIR`.
+
+**Safety extras:** before any write, `restore`/`auto` run a SMART health check
+and refuse on a failing drive unless you pass `--force` (image it first). The
+`undo` command rolls a disk back to any saved-table backup.
 
 Typical session:
 
@@ -81,8 +96,10 @@ Example output (a disk with a live Windows layout over dead Linux ghosts):
 
 ## What it detects
 
-NTFS, FAT12/16/32, exFAT, ext2/3/4, Linux swap — and reconstructs the
-Microsoft Reserved (MSR) gap on Windows disks. See [docs/SIGNATURES.md](docs/SIGNATURES.md).
+NTFS, FAT12/16/32, exFAT, ext2/3/4, Linux swap — and **flags** LVM2 PVs and
+LUKS-encrypted volumes (reported, not rebuilt, since they're not sizeable from a
+single header). Reconstructs the Microsoft Reserved (MSR) gap on Windows disks.
+See [docs/SIGNATURES.md](docs/SIGNATURES.md).
 
 ## More docs
 

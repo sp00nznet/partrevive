@@ -2,14 +2,19 @@
 
 Ideas, roughly in priority order. Nothing here is committed.
 
+## Done
+- **rescue** — copy files out of every live partition (source stays read-only).
+- **undo** — roll a disk back to any saved-table backup.
+- **SMART preflight** — `restore`/`auto` refuse on a failing drive unless `--force`.
+- **Image input** — pass a disk-image file; it's auto-attached as a loop device
+  (recover against a `ddrescue` copy without touching the patient).
+- **LVM2 / LUKS detection** — flagged in the scan (report-only).
+
 ## Near term
 - **MBR output** (`--mbr`) in addition to GPT.
-- **More filesystems**: btrfs, XFS, F2FS, LVM2 PV, LUKS, HFS+/APFS detection.
-- **Image mode**: `partrevive image /dev/sdX out.img` wrapping `ddrescue`
-  (with a mapfile), then recover against the image — ties into salvaging flaky
-  pulls without stressing the patient drive.
-- **SMART preflight**: warn (and require `--force`) when the target reports
-  failing health before any write.
+- **More filesystems**: btrfs, XFS, F2FS, HFS+/APFS detection (with real sizes).
+- **`ddrescue` wrapper**: `partrevive image /dev/sdX out.img` driving ddrescue
+  with a mapfile, so imaging + recovery are one flow.
 
 ## Medium term
 - **Sector-size awareness for EMC/enterprise drives**: detect 520/528-byte

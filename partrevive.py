@@ -118,8 +118,9 @@ class Candidate:
     fstype: str
     label: str = ""
     typecode: str = "0700"     # sgdisk type; refined during verify
-    confidence: str = "signature"   # signature | mounted | ghost
+    confidence: str = "signature"   # signature | mounted | ghost | flagged
     note: str = ""
+    report_only: bool = False  # detected but not sizeable/mountable (LVM/LUKS)
     # populated by verify():
     blkid: str = ""
     mount_ok: bool = False
@@ -204,6 +205,31 @@ def _detect_swap(dev, part_start_byte):
     return Candidate(part_start_byte // SECTOR, size_sectors, "swap", typecode="8200")
 
 
+def _detect_luks(dev, part_start_byte):
+    bs = read_at(dev, part_start_byte, 8)
+    if bs[0:6] != b"LUKS\xba\xbe":          # LUKS1 & LUKS2 both start here
+        return None
+    ver = int.from_bytes(bs[6:8], "big")    # version is big-endian
+    return Candidate(part_start_byte // SECTOR, MIN_PART_SECTORS, "crypto_LUKS",
+                     typecode="8309", report_only=True,
+                     note=f"LUKS{ver or '?'} encrypted — unlock to recover (cryptsetup)")
+
+
+def _detect_lvm(dev, part_start_byte_of_label):
+    # The LVM2 PV label ("LABELONE") sits in one of the PV's first 4 sectors; its
+    # own header records which sector, so we can back-compute the PV start.
+    lh = read_at(dev, part_start_byte_of_label, 512)
+    if lh[0:8] != b"LABELONE" or lh[0x20:0x28] != b"LVM2 001":
+        return None
+    label_sector = _u(lh[8:16])
+    start = part_start_byte_of_label - label_sector * SECTOR
+    if start < 0 or start % SECTOR != 0:
+        return None
+    return Candidate(start // SECTOR, MIN_PART_SECTORS, "LVM2_member",
+                     typecode="8E00", report_only=True,
+                     note="LVM physical volume — activate with vgscan/vgchange to recover")
+
+
 # magic string, its byte offset from partition start, detector, alignment(hit%512)
 SIGNATURES = [
     (b"NTFS    ", 3,     _detect_ntfs),
@@ -214,6 +240,8 @@ SIGNATURES = [
     (b"\x53\xef", 0x438, _detect_ext),       # ext2/3/4
     (b"SWAPSPACE2", 4086, _detect_swap),
     (b"SWAP-SPACE", 4086, _detect_swap),
+    (b"LUKS\xba\xbe", 0,  _detect_luks),     # LUKS (report-only)
+    (b"LABELONE",   0,    _detect_lvm),      # LVM2 PV (report-only)
 ]
 
 # ---- scan -------------------------------------------------------------------
@@ -287,6 +315,12 @@ def verify(dev: str, cands: list[Candidate], on_result=None) -> list[Candidate]:
     mnt = tempfile.mkdtemp(prefix="partrevive_")
     try:
         for c in cands:
+            if c.report_only:                  # LVM/LUKS: flagged, not mountable here
+                c.confidence = "flagged"
+                log(f"  [{yellow('flag ')}] {c.fstype:12} @ {c.start:>12}  -> {c.note}")
+                if on_result:
+                    on_result(c)
+                continue
             loop = ""
             try:
                 loop = _losetup(dev, c.start, c.size)
@@ -369,12 +403,21 @@ def plan(cands: list[Candidate], dev: str) -> list[Candidate]:
 
 # ---- restore (the only writing operation) -----------------------------------
 
-def restore(dev: str, parts: list[Candidate], *, assume_yes: bool, backup_dir: str):
+def restore(dev: str, parts: list[Candidate], *, assume_yes: bool, backup_dir: str, force: bool = False):
     if not parts:
         die("nothing to restore — no live partitions found")
-    for c in parts:
-        if _is_mounted(dev):
-            die(f"{dev} (or a partition of it) is mounted — unmount before restoring")
+    if _is_mounted(dev):
+        die(f"{dev} (or a partition of it) is mounted — unmount before restoring")
+    ok, summary = smart_health(dev)
+    if ok is False:
+        log(red(f"⚠ {summary}"))
+        if not force:
+            die("drive reports failing health — image it with ddrescue first, "
+                "or pass --force to write anyway")
+    elif ok is None:
+        log(dim(f"({summary})"))
+    else:
+        log(dim(summary))
     print()
     log(bold(f"proposed GPT for {dev}:"))
     _print_table(parts, dev)
@@ -413,17 +456,133 @@ def write_gpt(dev: str, parts: list[Candidate], backup_dir: str) -> str:
     time.sleep(2)
     return backup
 
+# ---- SMART preflight --------------------------------------------------------
+
+def smart_health(dev: str):
+    """Best-effort drive-health check. Returns (ok, summary):
+    ok is True (healthy), False (failing), or None (unknown/unavailable)."""
+    if not shutil.which("smartctl") or _is_loop_or_image(dev):
+        return None, "SMART unavailable"
+    # USB bridges usually need an explicit device type; try a few.
+    out = ""
+    for dtype in (None, "sat", "scsi"):
+        cmd = ["smartctl", "-H", "-A"] + (["-d", dtype] if dtype else []) + [dev]
+        r = run(cmd, check=False)
+        out = r.stdout or ""
+        if "self-assessment" in out.lower() or "SMART Health" in out:
+            break
+    low = out.lower()
+    if "failed" in low and "self-assessment" in low:
+        return False, "SMART overall-health: FAILED"
+    bad = 0
+    for line in out.splitlines():
+        if any(k in line for k in ("Reallocated_Sector", "Current_Pending_Sector",
+                                   "Offline_Uncorrectable", "Reported_Uncorrect")):
+            parts = line.split()
+            try:
+                if int(parts[-1]) > 0:
+                    bad += int(parts[-1])
+            except ValueError:
+                pass
+    if bad:
+        return False, f"SMART: {bad} reallocated/pending/uncorrectable sectors"
+    if "passed" in low:
+        return True, "SMART overall-health: PASSED"
+    return None, "SMART status indeterminate"
+
+
+# ---- rescue: copy files out (no writes to the source) -----------------------
+
+def rescue(dev: str, cands: list[Candidate], dest: str) -> dict:
+    """Mount each live partition read-only and copy its contents into dest.
+    Never writes to the source disk. Returns a per-partition summary."""
+    live = [c for c in cands if c.confidence == "mounted" and c.fstype != "swap"]
+    if not live:
+        die("no live (mountable) partitions to rescue")
+    os.makedirs(dest, exist_ok=True)
+    mnt = tempfile.mkdtemp(prefix="partrevive_rescue_")
+    results = []
+    copier = "rsync" if shutil.which("rsync") else "cp"
+    try:
+        for n, c in enumerate(live, 1):
+            label = (c.label or c.fstype).replace("/", "_").strip() or c.fstype
+            outdir = os.path.join(dest, f"p{n}_{c.start}_{label}")
+            os.makedirs(outdir, exist_ok=True)
+            loop = ""
+            try:
+                loop = _losetup(dev, c.start, c.size)
+                if run(["mount", "-o", "ro", loop, mnt], check=False).returncode != 0:
+                    results.append((outdir, False, "mount failed")); continue
+                log(bold(f"rescuing p{n} ({c.fstype}, {human_sectors(c.size)}) -> {outdir}"))
+                if copier == "rsync":
+                    r = run(["rsync", "-a", "--info=progress2", "--no-inc-recursive",
+                             mnt + "/", outdir + "/"], check=False, capture=False)
+                else:
+                    r = run(["cp", "-a", mnt + "/.", outdir + "/"], check=False)
+                ok = (r.returncode == 0)
+                results.append((outdir, ok, "ok" if ok else "copy errors (partial)"))
+            finally:
+                run(["umount", mnt], check=False)
+                if loop:
+                    run(["losetup", "-d", loop], check=False)
+    finally:
+        shutil.rmtree(mnt, ignore_errors=True)
+    log(bold("\nrescue summary:"))
+    for outdir, ok, msg in results:
+        log(("  " + green("✓") if ok else "  " + red("✗")) + f" {outdir}  ({msg})")
+    return {"dest": dest, "partitions": results}
+
+
+# ---- undo: restore a saved table -------------------------------------------
+
+def undo(dev: str, backup_file: str):
+    if not os.path.exists(backup_file):
+        die(f"backup file not found: {backup_file}")
+    if _is_mounted(dev):
+        die(f"{dev} is mounted — unmount before restoring a table")
+    run(["sgdisk", f"--load-backup={backup_file}", dev])
+    run(["partprobe", dev], check=False)
+    time.sleep(1)
+    log(green(f"restored table on {dev} from {backup_file}"))
+    log(run(["sgdisk", "-p", dev]).stdout)
+
 # ---- helpers ----------------------------------------------------------------
+
+def human_sectors(sectors: int) -> str:
+    b = sectors * SECTOR
+    for unit, div in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if b >= div:
+            return f"{b/div:.1f} {unit}"
+    return f"{b} B"
 
 def _is_mounted(dev: str) -> bool:
     mounts = run(["lsblk", "-no", "MOUNTPOINT", dev], check=False).stdout
     return any(line.strip() for line in mounts.splitlines())
 
+def _is_loop_or_image(dev: str) -> bool:
+    return dev.startswith("/dev/loop") or os.path.isfile(dev)
+
+
+def setup_target(path: str, *, writable: bool):
+    """Resolve the target to a block device. If `path` is a regular file (a disk
+    image), attach it as a loop device. Returns (dev, loop_to_detach_or_None)."""
+    if os.path.isfile(path):
+        flags = ["losetup", "-P", "-f", "--show"]
+        if not writable:
+            flags.insert(1, "-r")
+        loop = run(flags + [path]).stdout.strip()
+        log(dim(f"attached image {path} -> {loop} ({'rw' if writable else 'ro'})"))
+        return loop, loop
+    return path, None
+
+def teardown_target(loop):
+    if loop:
+        run(["losetup", "-d", loop], check=False)
+
 def _print_table(parts: list[Candidate], dev: str):
     print(f"  {'#':<3}{'start':>12}{'end':>14}{'size':>11}  {'code':<6}{'type'}")
     for i, c in enumerate(parts, 1):
-        gb = c.size * SECTOR / 1e9
-        sz = f"{gb:.1f}G" if gb >= 1 else f"{c.size*SECTOR/1e6:.0f}M"
+        sz = "?" if c.report_only else human_sectors(c.size).replace(" ", "")
         kind = c.note or c.fstype
         flag = green("live") if c.confidence == "mounted" else dim(c.confidence)
         print(f"  {i:<3}{c.start:>12}{c.end:>14}{sz:>11}  {c.typecode:<6}{kind}  [{flag}]")
@@ -480,48 +639,70 @@ def main():
         ("scan", "find candidate filesystems (read-only)"),
         ("verify", "scan + mount-test each candidate (read-only)"),
         ("plan", "verify + resolve overlaps into a proposed table (read-only)"),
+        ("rescue", "copy files out of every live partition (read-only source)"),
         ("restore", "plan + back up current table + write new GPT"),
         ("auto", "scan -> verify -> plan -> restore in one shot"),
+        ("undo", "restore a previously saved partition table"),
     ]:
         p = sub.add_parser(name, help=helptext)
-        p.add_argument("device")
-        p.add_argument("--deep", action="store_true", help="full-surface sweep")
+        p.add_argument("device", help="block device or a disk image file")
+        if name != "undo":
+            p.add_argument("--deep", action="store_true", help="full-surface sweep")
+        if name == "rescue":
+            p.add_argument("--to", required=True, metavar="DIR", help="destination directory")
+        if name == "undo":
+            p.add_argument("backup", help="the <dev>-gpt-<stamp>.bin backup file")
         if name in ("restore", "auto"):
             p.add_argument("-y", "--yes", action="store_true", help="don't prompt before writing")
+            p.add_argument("--force", action="store_true", help="write even if SMART reports failing")
             p.add_argument("--backup-dir", default=".", help="where to save the table backup")
 
     args = ap.parse_args()
-    dev = args.device
-    _open_log(dev)
-    preflight(dev)
+    _open_log(args.device)
 
-    cands = scan(dev, deep=getattr(args, "deep", False))
-    if not cands:
-        die("no filesystem signatures found")
+    writable = args.cmd in ("restore", "auto", "undo")
+    dev, loop = setup_target(args.device, writable=writable)
+    try:
+        preflight(dev)
 
-    if args.cmd == "scan":
-        if args.json: _emit_json(dev, cands)
-        else:
-            for c in cands:
-                log(f"  {c.fstype:6} @ {c.start:>12}  {c.size*SECTOR/1e9:7.2f} GB  {c.label}")
-        return
+        if args.cmd == "undo":
+            undo(dev, args.backup)
+            return
 
-    verify(dev, cands)
-    if args.cmd == "verify":
-        if args.json: _emit_json(dev, cands)
-        return
+        cands = scan(dev, deep=getattr(args, "deep", False))
+        if not cands:
+            die("no filesystem signatures found")
 
-    parts = plan(cands, dev)
-    if args.cmd == "plan":
-        if args.json: _emit_json(dev, parts)
-        else:
-            print(); log(bold("proposed table:")); _print_table(parts, dev)
-            log(dim("\nrun `partrevive restore` to write it (current table is backed up first)."))
-        return
+        if args.cmd == "scan":
+            if args.json: _emit_json(dev, cands)
+            else:
+                for c in cands:
+                    sz = "    ?   " if c.report_only else f"{c.size*SECTOR/1e9:7.2f}"
+                    log(f"  {c.fstype:12} @ {c.start:>12}  {sz} GB  {c.note or c.label}")
+            return
 
-    # restore / auto
-    restore(dev, parts, assume_yes=getattr(args, "yes", False),
-            backup_dir=getattr(args, "backup_dir", "."))
+        verify(dev, cands)
+        if args.cmd == "verify":
+            if args.json: _emit_json(dev, cands)
+            return
+
+        if args.cmd == "rescue":
+            rescue(dev, cands, args.to)
+            return
+
+        parts = plan(cands, dev)
+        if args.cmd == "plan":
+            if args.json: _emit_json(dev, parts)
+            else:
+                print(); log(bold("proposed table:")); _print_table(parts, dev)
+                log(dim("\nrun `partrevive restore` to write it (current table is backed up first)."))
+            return
+
+        # restore / auto
+        restore(dev, parts, assume_yes=getattr(args, "yes", False),
+                backup_dir=getattr(args, "backup_dir", "."), force=getattr(args, "force", False))
+    finally:
+        teardown_target(loop)
 
 
 if __name__ == "__main__":

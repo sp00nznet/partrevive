@@ -14,8 +14,16 @@ SIGNATURES = [
     (b"\x53\xef", 0x438, _detect_ext),      # ext2/3/4 superblock magic 0xEF53
     (b"SWAPSPACE2", 4086, _detect_swap),
     (b"SWAP-SPACE", 4086, _detect_swap),
+    (b"LUKS\xba\xbe", 0,  _detect_luks),    # LUKS (report-only)
+    (b"LABELONE",   0,    _detect_lvm),     # LVM2 PV (report-only)
 ]
 ```
+
+**Report-only types.** LUKS and LVM2 PVs are detected and *flagged* but not
+sized or mounted (you can't size them from a single header, and they need
+`cryptsetup`/`vgchange` to open). Their detectors set `report_only=True`; the
+scanner lets them through regardless of size, `verify()` marks them `flagged`
+instead of mount-testing, and `plan()` excludes them from the proposed table.
 
 The byte offset is where the magic sits relative to the partition's first
 sector. The scanner uses it to back-compute the start and reject anything that
@@ -41,4 +49,4 @@ ext magic is only accepted at `offset % 512 == 56`).
    refine it in `_classify()`.
 
 Good next candidates: btrfs (magic `_BHRfS_M` @ 0x10040), XFS (`XFSB` @ 0),
-LVM2 (`LABELONE`), LUKS (`LUKS\xba\xbe` @ 0).
+F2FS (`\x10\x20\xf5\xf2` @ 0x400). LVM2 and LUKS are already detected (report-only).
