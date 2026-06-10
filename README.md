@@ -36,7 +36,12 @@ sudo ./partrevive.py rescue  /dev/sdX --to DIR   # copy files out (source stays 
 sudo ./partrevive.py restore /dev/sdX            # + back up table + write it (prompts)
 sudo ./partrevive.py auto    /dev/sdX            # the whole pipeline in one shot
 sudo ./partrevive.py undo    /dev/sdX TABLE.bin  # roll back to a saved table
+sudo ./partrevive.py image   /dev/sdX out.img    # ddrescue a failing drive to a copy
 ```
+
+`restore`/`auto` write GPT by default; add `--mbr` to write an MBR (msdos) table
+instead (≤4 primary partitions). `image` runs `ddrescue` in two passes (fast
+copy, then retry bad areas) with a mapfile, so you can recover against the copy.
 
 The `device` can also be a **disk image file** — partrevive attaches it as a
 loop device automatically, so you can `ddrescue` a flaky drive to an image and
@@ -96,10 +101,10 @@ Example output (a disk with a live Windows layout over dead Linux ghosts):
 
 ## What it detects
 
-NTFS, FAT12/16/32, exFAT, ext2/3/4, Linux swap — and **flags** LVM2 PVs and
-LUKS-encrypted volumes (reported, not rebuilt, since they're not sizeable from a
-single header). Reconstructs the Microsoft Reserved (MSR) gap on Windows disks.
-See [docs/SIGNATURES.md](docs/SIGNATURES.md).
+NTFS, FAT12/16/32, exFAT, ext2/3/4, btrfs, XFS, F2FS, Linux swap — and **flags**
+LVM2 PVs and LUKS-encrypted volumes (reported, not rebuilt, since they're not
+sizeable from a single header). Reconstructs the Microsoft Reserved (MSR) gap on
+Windows disks. See [docs/SIGNATURES.md](docs/SIGNATURES.md).
 
 ## More docs
 

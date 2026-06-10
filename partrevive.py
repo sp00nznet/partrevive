@@ -29,6 +29,7 @@ import time
 from dataclasses import dataclass, field, asdict
 
 SECTOR = 512
+_target_path = None               # original target arg (image path or device) for naming
 MIN_PART_SECTORS = 2048            # ignore sub-1MiB "partitions" (noise)
 CHUNK = 16 * 1024 * 1024           # sweep read size
 OVERLAP = 1 * 1024 * 1024          # re-read window so signatures don't straddle chunks
@@ -205,6 +206,46 @@ def _detect_swap(dev, part_start_byte):
     return Candidate(part_start_byte // SECTOR, size_sectors, "swap", typecode="8200")
 
 
+def _detect_btrfs(dev, part_start_byte):
+    sb = read_at(dev, part_start_byte + 0x10000, 4096)   # primary superblock @ +64KiB
+    if sb[0x40:0x48] != b"_BHRfS_M":
+        return None
+    if _u(sb[0x30:0x38]) != 0x10000:                     # bytenr: 0x10000 = primary, else a mirror
+        return None
+    total = _u(sb[0x70:0x78])                            # total_bytes (single-device fs)
+    sectorsize = _u(sb[0x90:0x94])
+    if total <= 0 or sectorsize not in (512, 1024, 2048, 4096, 8192, 16384, 32768, 65536):
+        return None
+    label = sb[0x12b:0x22b].split(b"\x00", 1)[0].decode("latin1", "replace")
+    return Candidate(part_start_byte // SECTOR, total // SECTOR, "btrfs",
+                     label=label, typecode="8300")
+
+
+def _detect_xfs(dev, part_start_byte):
+    bs = read_at(dev, part_start_byte, 512)              # superblock @ partition start (big-endian)
+    if bs[0:4] != b"XFSB":
+        return None
+    blocksize = int.from_bytes(bs[4:8], "big")
+    dblocks = int.from_bytes(bs[8:16], "big")
+    if dblocks <= 0 or blocksize < 512 or blocksize > 65536 or (blocksize & (blocksize - 1)):
+        return None
+    label = bs[0x6c:0x78].split(b"\x00", 1)[0].decode("latin1", "replace")
+    return Candidate(part_start_byte // SECTOR, dblocks * (blocksize // SECTOR), "xfs",
+                     label=label, typecode="8300")
+
+
+def _detect_f2fs(dev, part_start_byte):
+    sb = read_at(dev, part_start_byte + 0x400, 512)      # superblock @ +1024
+    if sb[0:4] != b"\x10\x20\xf5\xf2":                   # magic 0xF2F52010 LE
+        return None
+    blocksize = 1 << _u(sb[0x10:0x14])                   # log_blocksize
+    block_count = _u(sb[0x24:0x2c])
+    if block_count <= 0 or blocksize < 512:
+        return None
+    return Candidate(part_start_byte // SECTOR, block_count * (blocksize // SECTOR), "f2fs",
+                     typecode="8300")
+
+
 def _detect_luks(dev, part_start_byte):
     bs = read_at(dev, part_start_byte, 8)
     if bs[0:6] != b"LUKS\xba\xbe":          # LUKS1 & LUKS2 both start here
@@ -238,6 +279,9 @@ SIGNATURES = [
     (b"FAT16   ", 0x36,  _detect_fat),
     (b"FAT12   ", 0x36,  _detect_fat),
     (b"\x53\xef", 0x438, _detect_ext),       # ext2/3/4
+    (b"_BHRfS_M", 0x10040, _detect_btrfs),   # btrfs
+    (b"XFSB",     0,     _detect_xfs),        # XFS
+    (b"\x10\x20\xf5\xf2", 0x400, _detect_f2fs),  # F2FS
     (b"SWAPSPACE2", 4086, _detect_swap),
     (b"SWAP-SPACE", 4086, _detect_swap),
     (b"LUKS\xba\xbe", 0,  _detect_luks),     # LUKS (report-only)
@@ -300,7 +344,20 @@ def scan(dev: str, *, deep: bool, progress=True, on_progress=None, on_found=None
                 pass
     if progress:
         print("\r" + " " * 20 + "\r", end="")
-    return sorted(found.values(), key=lambda c: c.start)
+    return _dedup_contained(sorted(found.values(), key=lambda c: c.start))
+
+
+def _dedup_contained(cands: list[Candidate]) -> list[Candidate]:
+    """Drop secondary/backup superblocks: a candidate that sits inside an earlier
+    same-fstype candidate of identical size is a copy, not a distinct partition.
+    Different-size or different-fstype overlaps are kept (verify/plan resolve them)."""
+    kept: list[Candidate] = []
+    for c in cands:
+        if any(k.fstype == c.fstype and k.size == c.size and k.start < c.start <= k.end
+               for k in kept):
+            continue
+        kept.append(c)
+    return kept
 
 # ---- verify (read-only) -----------------------------------------------------
 
@@ -403,7 +460,8 @@ def plan(cands: list[Candidate], dev: str) -> list[Candidate]:
 
 # ---- restore (the only writing operation) -----------------------------------
 
-def restore(dev: str, parts: list[Candidate], *, assume_yes: bool, backup_dir: str, force: bool = False):
+def restore(dev: str, parts: list[Candidate], *, assume_yes: bool, backup_dir: str,
+            force: bool = False, mbr: bool = False):
     if not parts:
         die("nothing to restore — no live partitions found")
     if _is_mounted(dev):
@@ -419,18 +477,18 @@ def restore(dev: str, parts: list[Candidate], *, assume_yes: bool, backup_dir: s
     else:
         log(dim(summary))
     print()
-    log(bold(f"proposed GPT for {dev}:"))
+    log(bold(f"proposed {'MBR' if mbr else 'GPT'} for {dev}:"))
     _print_table(parts, dev)
     if not assume_yes:
         ans = input(bold("\nwrite this partition table? ") + "[y/N] ").strip().lower()
         if ans != "y":
             die("aborted by user", code=0)
 
-    backup = write_gpt(dev, parts, backup_dir)
-    log(green("partition table written."))
+    backup = write_mbr(dev, parts, backup_dir) if mbr else write_gpt(dev, parts, backup_dir)
+    log(green(f"{'MBR' if mbr else 'GPT'} partition table written."))
     print()
-    log(run(["sgdisk", "-p", dev]).stdout)
-    log(dim(f"undo with:  sgdisk --load-backup={backup} {dev}"))
+    log(run(["fdisk" if mbr else "sgdisk", "-l" if mbr else "-p", dev]).stdout)
+    log(dim(f"undo with:  partrevive undo {_target_path or dev} {backup}"))
 
 
 def write_gpt(dev: str, parts: list[Candidate], backup_dir: str) -> str:
@@ -438,7 +496,7 @@ def write_gpt(dev: str, parts: list[Candidate], backup_dir: str) -> str:
     The single disk-writing primitive; shared by the CLI and the GUI."""
     os.makedirs(backup_dir, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    backup = os.path.join(backup_dir, f"{os.path.basename(dev)}-gpt-{stamp}.bin")
+    backup = os.path.join(backup_dir, f"{os.path.basename(_target_path or dev)}-gpt-{stamp}.bin")
     run(["sgdisk", f"--backup={backup}", dev])
     log(green(f"backed up current table -> {backup}"))
 
@@ -455,6 +513,61 @@ def write_gpt(dev: str, parts: list[Candidate], backup_dir: str) -> str:
     run(["partprobe", dev], check=False)
     time.sleep(2)
     return backup
+
+
+def _mbr_type(c: Candidate) -> str:
+    if c.typecode == "EF00": return "ef"        # EFI system
+    if c.typecode == "2700": return "27"        # Windows recovery
+    if c.typecode == "8200": return "82"        # Linux swap
+    if c.typecode == "8300": return "83"        # Linux
+    return "c" if c.fstype == "vfat" else "7"   # FAT32 LBA vs NTFS/exFAT/HPFS
+
+
+def write_mbr(dev: str, parts: list[Candidate], backup_dir: str) -> str:
+    """Write an MBR (msdos) table via sfdisk. Backs up the current table to a
+    .sfdisk dump first. MBR holds at most 4 primary partitions; MSR/report-only
+    entries are dropped (no MBR equivalent)."""
+    usable = [c for c in parts if c.typecode != "0C01" and not c.report_only]
+    if len(usable) > 4:
+        die(f"MBR supports at most 4 primary partitions ({len(usable)} planned) — use GPT")
+    os.makedirs(backup_dir, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = os.path.join(backup_dir, f"{os.path.basename(_target_path or dev)}-table-{stamp}.sfdisk")
+    r = run(["sfdisk", "-d", dev], check=False)             # run() merges stderr into stdout
+    dump = r.stdout if r.returncode == 0 else ""
+    with open(backup, "w") as fh:
+        # if there's no prior table, an empty "label: dos" restores to a clean slate
+        fh.write(dump if dump.strip() else "label: dos\n")
+    log(green(f"backed up current table -> {backup}"))
+
+    script = "label: dos\n" + "".join(
+        f"start={c.start}, size={c.size}, type={_mbr_type(c)}\n" for c in usable)
+    p = subprocess.run(["sfdisk", dev], input=script, text=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    if p.returncode != 0:
+        die("sfdisk failed:\n" + (p.stdout or ""))
+    run(["partprobe", dev], check=False)
+    time.sleep(2)
+    return backup
+
+
+# ---- image: ddrescue wrapper (read-only source) -----------------------------
+
+def image_drive(src: str, out: str):
+    """Image a (possibly failing) drive to a file with ddrescue + mapfile, then
+    you recover against the image. Two passes: fast copy, then retry bad areas."""
+    if not shutil.which("ddrescue"):
+        die("ddrescue not installed — `sudo apt install gddrescue`")
+    mapfile = out + ".map"
+    log(bold(f"imaging {src} -> {out}   (mapfile: {mapfile})"))
+    ok, summary = smart_health(src)
+    if ok is False:
+        log(red(f"⚠ {summary} — imaging now is exactly the right move; proceeding read-only"))
+    log(dim("pass 1/2: fast copy, skipping bad areas (-n) …"))
+    run(["ddrescue", "-n", src, out, mapfile], capture=False, check=False)
+    log(dim("pass 2/2: retrying bad areas (-r3) …"))
+    run(["ddrescue", "-r3", src, out, mapfile], capture=False, check=False)
+    log(green(f"done. recover from the copy with:  partrevive auto {out}"))
 
 # ---- SMART preflight --------------------------------------------------------
 
@@ -540,11 +653,20 @@ def undo(dev: str, backup_file: str):
         die(f"backup file not found: {backup_file}")
     if _is_mounted(dev):
         die(f"{dev} is mounted — unmount before restoring a table")
-    run(["sgdisk", f"--load-backup={backup_file}", dev])
+    with open(backup_file, "rb") as fh:
+        head = fh.read(512)
+    is_sfdisk = backup_file.endswith(".sfdisk") or b"label:" in head or b"label-id" in head
+    if is_sfdisk:                                   # MBR/GPT text dump from sfdisk
+        with open(backup_file) as fh:
+            p = subprocess.run(["sfdisk", dev], input=fh.read(), text=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if p.returncode != 0:
+            die("sfdisk restore failed:\n" + (p.stdout or ""))
+    else:                                           # sgdisk binary GPT backup
+        run(["sgdisk", f"--load-backup={backup_file}", dev])
     run(["partprobe", dev], check=False)
     time.sleep(1)
     log(green(f"restored table on {dev} from {backup_file}"))
-    log(run(["sgdisk", "-p", dev]).stdout)
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -566,6 +688,8 @@ def _is_loop_or_image(dev: str) -> bool:
 def setup_target(path: str, *, writable: bool):
     """Resolve the target to a block device. If `path` is a regular file (a disk
     image), attach it as a loop device. Returns (dev, loop_to_detach_or_None)."""
+    global _target_path
+    _target_path = path
     if os.path.isfile(path):
         flags = ["losetup", "-P", "-f", "--show"]
         if not writable:
@@ -640,21 +764,25 @@ def main():
         ("verify", "scan + mount-test each candidate (read-only)"),
         ("plan", "verify + resolve overlaps into a proposed table (read-only)"),
         ("rescue", "copy files out of every live partition (read-only source)"),
-        ("restore", "plan + back up current table + write new GPT"),
+        ("restore", "plan + back up current table + write new table"),
         ("auto", "scan -> verify -> plan -> restore in one shot"),
         ("undo", "restore a previously saved partition table"),
+        ("image", "ddrescue a (failing) drive to an image, then recover the copy"),
     ]:
         p = sub.add_parser(name, help=helptext)
         p.add_argument("device", help="block device or a disk image file")
-        if name != "undo":
+        if name not in ("undo", "image"):
             p.add_argument("--deep", action="store_true", help="full-surface sweep")
         if name == "rescue":
             p.add_argument("--to", required=True, metavar="DIR", help="destination directory")
         if name == "undo":
-            p.add_argument("backup", help="the <dev>-gpt-<stamp>.bin backup file")
+            p.add_argument("backup", help="the saved-table backup (.bin or .sfdisk)")
+        if name == "image":
+            p.add_argument("out", help="output image file (a .map mapfile is written alongside)")
         if name in ("restore", "auto"):
             p.add_argument("-y", "--yes", action="store_true", help="don't prompt before writing")
             p.add_argument("--force", action="store_true", help="write even if SMART reports failing")
+            p.add_argument("--mbr", action="store_true", help="write an MBR (msdos) table instead of GPT")
             p.add_argument("--backup-dir", default=".", help="where to save the table backup")
 
     args = ap.parse_args()
@@ -667,6 +795,10 @@ def main():
 
         if args.cmd == "undo":
             undo(dev, args.backup)
+            return
+
+        if args.cmd == "image":
+            image_drive(dev, args.out)
             return
 
         cands = scan(dev, deep=getattr(args, "deep", False))
@@ -700,7 +832,8 @@ def main():
 
         # restore / auto
         restore(dev, parts, assume_yes=getattr(args, "yes", False),
-                backup_dir=getattr(args, "backup_dir", "."), force=getattr(args, "force", False))
+                backup_dir=getattr(args, "backup_dir", "."), force=getattr(args, "force", False),
+                mbr=getattr(args, "mbr", False))
     finally:
         teardown_target(loop)
 

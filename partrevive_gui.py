@@ -43,6 +43,7 @@ class PartReviveGUI:
         self.busy = False
         self.dev = tk.StringVar()
         self.deep = tk.BooleanVar(value=False)
+        self.mbr = tk.BooleanVar(value=False)
         self.backup_dir = tk.StringVar(value=os.path.expanduser("~"))
 
         pr.set_log_sink(self._log_sink)
@@ -81,10 +82,13 @@ class PartReviveGUI:
         self.rescue_btn.pack(side="left", padx=(6, 0))
         self.plan_btn = ttk.Button(act, text="② Build Plan", command=self.build_plan, state="disabled")
         self.plan_btn.pack(side="left", padx=6)
-        self.restore_btn = ttk.Button(act, text="③ Restore  (write GPT)", command=self.do_restore, state="disabled")
+        self.restore_btn = ttk.Button(act, text="③ Restore  (write table)", command=self.do_restore, state="disabled")
         self.restore_btn.pack(side="left")
-        self.prog = ttk.Progressbar(act, mode="determinate", length=200)
+        ttk.Checkbutton(act, text="MBR", variable=self.mbr).pack(side="left", padx=6)
+        self.prog = ttk.Progressbar(act, mode="determinate", length=160)
         self.prog.pack(side="right")
+        self.image_btn = ttk.Button(act, text="🖫 Image (ddrescue)…", command=self.do_image)
+        self.image_btn.pack(side="right", padx=8)
 
     def _build_panes(self, root):
         pan = ttk.PanedWindow(root, orient="vertical")
@@ -150,6 +154,7 @@ class PartReviveGUI:
         self.busy = busy
         state = "disabled" if busy else "normal"
         self.scan_btn.config(state=state)
+        self.image_btn.config(state=state)
         self.disk_cb.config(state="disabled" if busy else "readonly")
         if busy:
             for b in (self.plan_btn, self.restore_btn, self.rescue_btn):
@@ -302,10 +307,42 @@ class PartReviveGUI:
 
     def _restore_worker(self, dev, parts):
         try:
-            backup = pr.write_gpt(dev, parts, self.backup_dir.get())
+            if self.mbr.get():
+                backup = pr.write_mbr(dev, parts, self.backup_dir.get())
+            else:
+                backup = pr.write_gpt(dev, parts, self.backup_dir.get())
             self.root.after(0, lambda: self._restore_done(dev, backup))
         except Exception as e:
             self.root.after(0, lambda: (self.say(f"restore error: {e}"), self._set_busy(False)))
+
+    # ---------------------------------------------------------------- image
+    def do_image(self):
+        dev = self._cur_dev()
+        if not dev:
+            messagebox.showinfo("partrevive", "Pick a disk first."); return
+        if not __import__("shutil").which("ddrescue"):
+            messagebox.showerror("partrevive",
+                "ddrescue not installed.\n\nInstall it with:  sudo apt install gddrescue"); return
+        out = filedialog.asksaveasfilename(title="Save disk image as…",
+                                           initialdir=self.backup_dir.get(),
+                                           defaultextension=".img",
+                                           filetypes=[("Disk image", "*.img"), ("All", "*")])
+        if not out:
+            return
+        self._set_busy(True)
+        self.say(f"imaging {dev} → {out} (ddrescue, two passes; watch the Log/terminal)…")
+        threading.Thread(target=self._image_worker, args=(dev, out), daemon=True).start()
+
+    def _image_worker(self, dev, out):
+        try:
+            pr.image_drive(dev, out)
+            self.root.after(0, lambda: (self._set_busy(False),
+                self.say(f"image complete → {out}"),
+                messagebox.showinfo("partrevive",
+                    f"Imaged to:\n{out}\n\nNow recover from the copy: pick {out} as the "
+                    "target (or run `partrevive auto {out}`).")))
+        except Exception as e:
+            self.root.after(0, lambda: (self._set_busy(False), self.say(f"image error: {e}")))
 
     def _restore_done(self, dev, backup):
         self._set_busy(False)
